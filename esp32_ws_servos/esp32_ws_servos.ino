@@ -1,7 +1,9 @@
 /*
   WallCrawler - Wi-Fi AP + ArduinoOTA + WebSocket slider page
-  Step 2: FRONT and BACK MG996R tilt servos, controlled by sliders only.
-  Still NO ESC / motor / wheel-servo code.
+  Step 3: FRONT and BACK MG996R tilt servos + two BLHeli ESCs (RS2205 motors), all by sliders.
+  Still NO wheel-servo code.
+
+  !!! REMOVE THE PROPELLERS for all first tests !!!
 
   Libraries to install (Library Manager or ZIP):
     - "ESP Async WebServer" by ESP32Async
@@ -26,10 +28,21 @@ const char* OTA_HOSTNAME = "wallbot";
 const char* OTA_PASS     = "ota1234";
 
 // ---------- MG996R servo settings ----------
-const int SERVO_F_PIN = 13;          // FRONT MG996R signal pin (change to your wiring)
+const int SERVO_F_PIN = 18;          // FRONT MG996R signal pin (change to your wiring)
 const int SERVO_B_PIN = 19;          // BACK  MG996R signal pin (change to your wiring)
 const int SERVO_MIN_US = 500;        // pulse width for 0 deg
 const int SERVO_MAX_US = 2400;       // pulse width for 180 deg (calibrate if the ends buzz)
+
+// ---------- ESC settings (standard 50 Hz PWM, 1000..2000 us) ----------
+const int ESC_A_PIN = 25;            // ESC 1 signal pin (change to your wiring)
+const int ESC_B_PIN = 26;            // ESC 2 signal pin (change to your wiring)
+const int ESC_MIN_US = 1000;         // zero throttle (also the arming signal)
+const int ESC_MAX_US = 2000;         // full throttle
+
+const float THROTTLE_LIMIT_PCT = 30.0;     // slider 100% = 30% of full ESC range. RAISE ONLY AFTER TESTING.
+const uint32_t ESC_ARM_HOLD_MS = 3000;     // hold zero throttle this long after boot so the ESCs arm
+const float RAMP_UP_PER_STEP   = 1.5;      // slider % per 20 ms going up  (~75 % per second)
+const float RAMP_DOWN_PER_STEP = 5.0;      // slider % per 20 ms going down
 
 const int FRONT_DEFAULT_DEG = 0;     // front rests at 0, slider range 0..180
 const int BACK_DEFAULT_DEG  = 90;    // back rests at 90, slider range 0..180 (90 each side)
@@ -40,10 +53,16 @@ const uint32_t FAILSAFE_MS = 300;    // no packet for this long -> servos return
 // ---------- Latest values received from the page ----------
 volatile int ctl_front = FRONT_DEFAULT_DEG;   // 0..180 (degrees)
 volatile int ctl_back  = BACK_DEFAULT_DEG;    // 0..180 (degrees)
+volatile int ctl_thrA  = 0;                   // 0..100 (%)
+volatile int ctl_thrB  = 0;                   // 0..100 (%)
 volatile int ctl_arm   = 0;                   // 0/1
 volatile uint32_t lastPacketMs = 0;
 
 Servo servoF, servoB;
+Servo escA, escB;
+float curThrA = 0, curThrB = 0;      // current throttle (slider %), after ramping
+bool  throttleUnlocked = false;      // true only after both throttles were seen at 0 while armed
+uint32_t bootMs = 0;
 float curF = FRONT_DEFAULT_DEG;      // current angles, for slew limiting
 float curB = BACK_DEFAULT_DEG;
 
@@ -57,13 +76,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>WallCrawler Controller</title>
+<title>WallBot Controller</title>
 <style>
   :root { --bg:#111418; --panel:#1b2027; --line:#2c3440; --fg:#e8edf2; --dim:#8b97a6; --acc:#3aa0ff; --ok:#3ddc84; --bad:#ff5c5c; }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
-              font-family:system-ui,Segoe UI,Roboto,sans-serif; overflow:hidden; user-select:none; -webkit-user-select:none; }
-  .wrap { height:100%; display:flex; flex-direction:column; padding:12px; gap:12px; max-width:700px; margin:0 auto; }
+              font-family:system-ui,Segoe UI,Roboto,sans-serif; overflow:auto; user-select:none; -webkit-user-select:none; }
+  .wrap { min-height:100%; display:flex; flex-direction:column; padding:12px 12px 48px; gap:12px; max-width:700px; margin:0 auto; }
   .top { display:flex; align-items:center; justify-content:space-between; gap:10px; }
   .status { display:flex; align-items:center; gap:8px; font-size:14px; }
   .dot { width:12px; height:12px; border-radius:50%; background:var(--bad); }
@@ -72,10 +91,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   button.arm { padding:14px; font-size:18px; font-weight:700; border-radius:12px; border:2px solid var(--line);
                background:var(--panel); color:var(--fg); }
   button.arm.on { border-color:var(--bad); background:#3a1d1d; color:#ffb3b3; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px 16px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:8px 14px; }
   .card h2 { margin:0 0 4px; font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); font-weight:600; }
   .row { display:flex; align-items:baseline; justify-content:space-between; }
-  .val { font:700 34px ui-monospace,Menlo,Consolas,monospace; }
+  .val { font:700 26px ui-monospace,Menlo,Consolas,monospace; }
   .val small { font-size:16px; color:var(--dim); }
   .ends { display:flex; justify-content:space-between; font-size:12px; color:var(--dim); margin-top:2px; }
   input[type=range] { -webkit-appearance:none; appearance:none; width:100%; height:46px; background:transparent;
@@ -117,7 +136,28 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div class="ends"><span>0&deg;</span><span>90&deg; (rest)</span><span>180&deg;</span></div>
   </div>
 
-  <div class="hint">Sliders are locked until ARM is ON. Turning ARM on or off resets both sliders to rest.</div>
+  <div class="card">
+    <h2>Motor 1 (ESC 1)</h2>
+    <div class="row"><div class="val"><span id="av">0</span><small>%</small></div></div>
+    <input type="range" id="thrA" min="0" max="100" value="0" disabled>
+    <div class="ends"><span>0% (stop)</span><span>100%</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Motor 2 (ESC 2)</h2>
+    <div class="row">
+      <div class="val"><span id="mv">0</span><small>%</small></div>
+      <label class="small" style="display:flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;">
+        <input type="checkbox" id="link" style="width:18px;height:18px;"> Link both
+      </label>
+    </div>
+    <input type="range" id="thrB" min="0" max="100" value="0" disabled>
+    <div class="ends"><span>0% (stop)</span><span>100%</span></div>
+  </div>
+
+  <button class="arm" id="stop" style="padding:10px;font-size:15px;">MOTORS TO 0</button>
+
+  <div class="hint">Sliders are locked until ARM is ON. Turning ARM on or off resets all sliders to rest. Motors only spin after both motor sliders are at 0 once armed.</div>
 </div>
 
 <script>
@@ -131,22 +171,37 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   const fv = document.getElementById('fv');
   const bv = document.getElementById('bv');
   const bcenter = document.getElementById('bcenter');
+  const thrA = document.getElementById('thrA');
+  const thrB = document.getElementById('thrB');
+  const av = document.getElementById('av');
+  const mv = document.getElementById('mv');
+  const link = document.getElementById('link');
+  const stopBtn = document.getElementById('stop');
 
   const FRONT_REST = 0, BACK_REST = 90;
   let arm = 0;
   let ws = null;
 
-  function showValues() { fv.textContent = front.value; bv.textContent = back.value; }
+  function showValues() {
+    fv.textContent = front.value; bv.textContent = back.value;
+    av.textContent = thrA.value;  mv.textContent = thrB.value;
+  }
   front.addEventListener('input', showValues);
   back.addEventListener('input', showValues);
+  thrA.addEventListener('input', () => { if (link.checked) thrB.value = thrA.value; showValues(); });
+  thrB.addEventListener('input', () => { if (link.checked) thrA.value = thrB.value; showValues(); });
+  stopBtn.addEventListener('click', () => { thrA.value = 0; thrB.value = 0; showValues(); });
   bcenter.addEventListener('click', () => { back.value = BACK_REST; showValues(); });
 
-  function resetSliders() { front.value = FRONT_REST; back.value = BACK_REST; showValues(); }
+  function resetSliders() {
+    front.value = FRONT_REST; back.value = BACK_REST;
+    thrA.value = 0; thrB.value = 0; showValues();
+  }
 
   function setArm(v) {
     arm = v ? 1 : 0;
     resetSliders();                       // nothing jumps when arming/disarming
-    front.disabled = back.disabled = bcenter.disabled = !arm;
+    front.disabled = back.disabled = bcenter.disabled = thrA.disabled = thrB.disabled = !arm;
     armBtn.textContent = 'ARM: ' + (arm ? 'ON' : 'OFF');
     armBtn.classList.toggle('on', !!arm);
   }
@@ -172,10 +227,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   }
   connect();
 
-  // ---- Send control packet at ~30 Hz:  S,front,back,arm ----
+  // ---- Send control packet at ~30 Hz:  S,front,back,thrA,thrB,arm ----
   setInterval(() => {
     if (ws && ws.readyState === 1) {
-      ws.send('S,' + front.value + ',' + back.value + ',' + arm);
+      ws.send('S,' + front.value + ',' + back.value + ',' + thrA.value + ',' + thrB.value + ',' + arm);
     }
   }, 33);
 
@@ -196,6 +251,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 void resetControls() {
   ctl_front = FRONT_DEFAULT_DEG;
   ctl_back  = BACK_DEFAULT_DEG;
+  ctl_thrA  = 0;
+  ctl_thrB  = 0;
   ctl_arm   = 0;
 }
 
@@ -221,10 +278,12 @@ void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client, AwsEventType t
       buf[n] = '\0';
 
       if (buf[0] == 'S') {
-        int f, b, a;
-        if (sscanf(buf, "S,%d,%d,%d", &f, &b, &a) == 3) {
+        int f, b, ta, tb, a;
+        if (sscanf(buf, "S,%d,%d,%d,%d,%d", &f, &b, &ta, &tb, &a) == 5) {
           ctl_front = constrain(f, 0, 180);
           ctl_back  = constrain(b, 0, 180);
+          ctl_thrA  = constrain(ta, 0, 100);
+          ctl_thrB  = constrain(tb, 0, 100);
           ctl_arm   = a ? 1 : 0;
           lastPacketMs = millis();
         }
@@ -271,8 +330,64 @@ void updateServos() {
   servoB.write((int)lroundf(curB));
 }
 
+// ---------- ESC handling (called every 20 ms) ----------
+int throttleToUs(float pct) {
+  float frac = (pct / 100.0f) * (THROTTLE_LIMIT_PCT / 100.0f);
+  return ESC_MIN_US + (int)lroundf((ESC_MAX_US - ESC_MIN_US) * frac);
+}
+
+void escsToZero() {
+  curThrA = curThrB = 0;
+  escA.writeMicroseconds(ESC_MIN_US);
+  escB.writeMicroseconds(ESC_MIN_US);
+}
+
+float ramp(float cur, float target) {
+  float d = target - cur;
+  if (d >  RAMP_UP_PER_STEP)   d =  RAMP_UP_PER_STEP;
+  if (d < -RAMP_DOWN_PER_STEP) d = -RAMP_DOWN_PER_STEP;
+  return cur + d;
+}
+
+void updateEscs() {
+  bool linkOk   = (millis() - lastPacketMs) < FAILSAFE_MS;
+  bool bootDone = (millis() - bootMs) > ESC_ARM_HOLD_MS;
+  bool armed    = ctl_arm && linkOk && bootDone;
+
+  static bool prevArmed = false;
+  if (armed && !prevArmed) throttleUnlocked = false;   // every (re)arm needs a fresh zero
+  prevArmed = armed;
+
+  if (!armed) {                        // disarmed, link lost, or ESCs still arming: stop at once
+    throttleUnlocked = false;
+    escsToZero();
+    return;
+  }
+
+  if (!throttleUnlocked && ctl_thrA == 0 && ctl_thrB == 0) throttleUnlocked = true;
+
+  float targetA = throttleUnlocked ? ctl_thrA : 0;
+  float targetB = throttleUnlocked ? ctl_thrB : 0;
+
+  curThrA = ramp(curThrA, targetA);
+  curThrB = ramp(curThrB, targetB);
+
+  escA.writeMicroseconds(throttleToUs(curThrA));
+  escB.writeMicroseconds(throttleToUs(curThrB));
+}
+
 void setup() {
   Serial.begin(115200);
+  bootMs = millis();
+
+  // ESCs first: send zero throttle immediately so they arm safely
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  escA.setPeriodHertz(50);
+  escB.setPeriodHertz(50);
+  escA.attach(ESC_A_PIN, ESC_MIN_US, ESC_MAX_US);
+  escB.attach(ESC_B_PIN, ESC_MIN_US, ESC_MAX_US);
+  escsToZero();
 
   // Servos (attach first so they go to rest immediately)
   ESP32PWM::allocateTimer(0);
@@ -293,8 +408,8 @@ void setup() {
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASS);
   ArduinoOTA.onStart([]() {
-    // TODO later: set ESC outputs to minimum here
     resetControls();
+    escsToZero();
     servosToDefault();
     Serial.println("OTA start");
   });
@@ -327,14 +442,16 @@ void loop() {
   if (millis() - lastServo >= 20) {
     lastServo = millis();
     updateServos();
+    updateEscs();
   }
 
   // Print status 5 times per second
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint >= 200) {
     lastPrint = millis();
-    Serial.printf("front=%d back=%d arm=%d age=%ums | servoF=%.0f servoB=%.0f\n",
-                  ctl_front, ctl_back, ctl_arm,
-                  (unsigned)(millis() - lastPacketMs), curF, curB);
+    Serial.printf("front=%d back=%d thrA=%d thrB=%d arm=%d age=%ums | servoF=%.0f servoB=%.0f escA=%dus escB=%dus unlocked=%d\n",
+                  ctl_front, ctl_back, ctl_thrA, ctl_thrB, ctl_arm,
+                  (unsigned)(millis() - lastPacketMs), curF, curB,
+                  throttleToUs(curThrA), throttleToUs(curThrB), throttleUnlocked);
   }
 }
