@@ -11,7 +11,7 @@ const int   AP_MAX_CLIENTS = 4;
 
 // ---- OTA settings ----
 const char* OTA_HOSTNAME = "wallbot";
-const char* OTA_PASS     = "ota12345";
+const char* OTA_PASS     = "ota1234";
 
 // void stopMotors() {
 //   // TODO: put your ESC outputs to minimum throttle here.
