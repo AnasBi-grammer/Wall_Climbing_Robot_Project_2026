@@ -51,16 +51,28 @@ const int BACK_DEFAULT_DEG  = 90;    // back rests at 90, slider range 0..180 (9
 const float SLEW_DEG_PER_STEP = 5.0; // speed limit: 5 deg per 20 ms (~250 deg/s)
 const uint32_t FAILSAFE_MS = 300;    // no packet for this long -> servos return to defaults
 
+// ---------- MG90S steering servos (front wheels) ----------
+const int STEER_L_PIN = 27;          // left  steering servo signal pin (change to your wiring)
+const int STEER_R_PIN = 32;          // right steering servo signal pin (change to your wiring)
+const int STEER_CENTER_DEG = 90;
+const int STEER_TRAVEL_DEG = 45;     // +/- from centre. Use 60 only if the frame allows it
+const bool STEER_L_INVERT = false;   // set true if that servo turns the wrong way
+const bool STEER_R_INVERT = false;
+
 // ---------- Latest values received from the page ----------
 volatile int ctl_front = FRONT_DEFAULT_DEG;   // 0..180 (degrees)
 volatile int ctl_back  = BACK_DEFAULT_DEG;    // 0..180 (degrees)
 volatile int ctl_thrA  = 0;                   // 0..100 (%)
 volatile int ctl_thrB  = 0;                   // 0..100 (%)
+volatile int ctl_steerL = STEER_CENTER_DEG;
+volatile int ctl_steerR = STEER_CENTER_DEG;
 volatile int ctl_arm   = 0;                   // 0/1
 volatile uint32_t lastPacketMs = 0;
 
 Servo servoF, servoB;
 Servo escA, escB;
+Servo servoSL, servoSR;
+float curSL = STEER_CENTER_DEG, curSR = STEER_CENTER_DEG;
 float curThrA = 0, curThrB = 0;      // current throttle (slider %), after ramping
 bool  throttleUnlocked = false;      // true only after both throttles were seen at 0 while armed
 uint32_t bootMs = 0;
@@ -124,6 +136,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <h2>Front servo</h2>
     <div class="row">
       <div class="val"><span id="fv">90</span><small>&deg;</small></div>
+    </div>
       <input type="range" id="front" min="0" max="180" value="90" disabled>
       <div class="ends"><span>0&deg;</span><span>90&deg; (rest)</span><span>180&deg;</span></div>
   </div>
@@ -136,6 +149,20 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </div>
     <input type="range" id="back" min="0" max="180" value="90" disabled>
     <div class="ends"><span>0&deg;</span><span>90&deg; (rest)</span><span>180&deg;</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Steering left (MG90S)</h2>
+    <div class="row"><div class="val"><span id="slv">90</span><small>&deg;</small></div></div>
+    <input type="range" id="steerL" min="45" max="135" value="90" disabled>
+    <div class="ends"><span>45&deg;</span><span>90&deg; (centre)</span><span>135&deg;</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Steering right (MG90S)</h2>
+    <div class="row"><div class="val"><span id="srv">90</span><small>&deg;</small></div></div>
+    <input type="range" id="steerR" min="45" max="135" value="90" disabled>
+    <div class="ends"><span>45&deg;</span><span>90&deg; (centre)</span><span>135&deg;</span></div>
   </div>
 
   <div class="card">
@@ -158,6 +185,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
 
   <button class="arm" id="stop" style="padding:10px;font-size:15px;">MOTORS TO 0</button>
+  <button class="arm" id="centerAll" style="padding:10px;font-size:15px;" disabled>CENTRE SERVOS (90&deg;)</button>
 
   <div class="hint">Sliders are locked until ARM is ON. Turning ARM on or off resets all sliders to rest. Motors only spin after both motor sliders are at 0 once armed.</div>
 </div>
@@ -179,6 +207,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   const mv = document.getElementById('mv');
   const link = document.getElementById('link');
   const stopBtn = document.getElementById('stop');
+  const centerBtn = document.getElementById('centerAll');
+  const steerL = document.getElementById('steerL');
+  const steerR = document.getElementById('steerR');
+  const slv = document.getElementById('slv');
+  const srv = document.getElementById('srv');
 
   const FRONT_REST = 90, BACK_REST = 90;
   let arm = 0;
@@ -187,23 +220,28 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   function showValues() {
     fv.textContent = front.value; bv.textContent = back.value;
     av.textContent = thrA.value;  mv.textContent = thrB.value;
+    slv.textContent = steerL.value; srv.textContent = steerR.value;
   }
   front.addEventListener('input', showValues);
   back.addEventListener('input', showValues);
+  steerL.addEventListener('input', showValues);
+  steerR.addEventListener('input', showValues);
   thrA.addEventListener('input', () => { if (link.checked) thrB.value = thrA.value; showValues(); });
   thrB.addEventListener('input', () => { if (link.checked) thrA.value = thrB.value; showValues(); });
   stopBtn.addEventListener('click', () => { thrA.value = 0; thrB.value = 0; showValues(); });
+  centerBtn.addEventListener('click', () => { front.value = FRONT_REST; back.value = BACK_REST; showValues(); });
   bcenter.addEventListener('click', () => { back.value = BACK_REST; showValues(); });
 
   function resetSliders() {
     front.value = FRONT_REST; back.value = BACK_REST;
     thrA.value = 0; thrB.value = 0; showValues();
+    steerL.value = 90; steerR.value = 90;
   }
 
   function setArm(v) {
     arm = v ? 1 : 0;
     resetSliders();                       // nothing jumps when arming/disarming
-    front.disabled = back.disabled = bcenter.disabled = thrA.disabled = thrB.disabled = !arm;
+    front.disabled = back.disabled = bcenter.disabled = thrA.disabled = thrB.disabled = centerBtn.disabled = steerL.disabled = steerR.disabled = !arm;
     armBtn.textContent = 'ARM: ' + (arm ? 'ON' : 'OFF');
     armBtn.classList.toggle('on', !!arm);
   }
@@ -232,7 +270,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   // ---- Send control packet at ~30 Hz:  S,front,back,thrA,thrB,arm ----
   setInterval(() => {
     if (ws && ws.readyState === 1) {
-      ws.send('S,' + front.value + ',' + back.value + ',' + thrA.value + ',' + thrB.value + ',' + arm);
+      ws.send('S,' + front.value + ',' + back.value + ',' + thrA.value + ',' + thrB.value + ',' +
+      steerL.value + ',' + steerR.value + ',' + arm);
     }
   }, 33);
 
@@ -256,6 +295,8 @@ void resetControls() {
   ctl_thrA  = 0;
   ctl_thrB  = 0;
   ctl_arm   = 0;
+  ctl_steerL = STEER_CENTER_DEG;
+  ctl_steerR = STEER_CENTER_DEG;
 }
 
 void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client, AwsEventType type,
@@ -280,8 +321,10 @@ void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client, AwsEventType t
       buf[n] = '\0';
 
       if (buf[0] == 'S') {
-        int f, b, ta, tb, a;
-        if (sscanf(buf, "S,%d,%d,%d,%d,%d", &f, &b, &ta, &tb, &a) == 5) {
+        int f, b, ta, tb, sl, sr, a;
+        if (sscanf(buf, "S,%d,%d,%d,%d,%d,%d,%d", &f, &b, &ta, &tb, &sl, &sr, &a) == 7) {
+          ctl_steerL = constrain(sl, STEER_CENTER_DEG - STEER_TRAVEL_DEG, STEER_CENTER_DEG + STEER_TRAVEL_DEG);
+          ctl_steerR = constrain(sr, STEER_CENTER_DEG - STEER_TRAVEL_DEG, STEER_CENTER_DEG + STEER_TRAVEL_DEG);
           ctl_front = constrain(f, 0, 180);
           ctl_back  = constrain(b, 0, 180);
           ctl_thrA  = constrain(ta, -100, 100);
@@ -313,6 +356,9 @@ void servosToDefault() {
   curB = BACK_DEFAULT_DEG;
   servoF.write(FRONT_DEFAULT_DEG);
   servoB.write(BACK_DEFAULT_DEG);
+  curSL = curSR = STEER_CENTER_DEG;
+  servoSL.write(STEER_L_INVERT ? 180 - STEER_CENTER_DEG : STEER_CENTER_DEG);
+  servoSR.write(STEER_R_INVERT ? 180 - STEER_CENTER_DEG : STEER_CENTER_DEG);
 }
 
 void updateServos() {
@@ -330,6 +376,15 @@ void updateServos() {
 
   servoF.write((int)lroundf(curF));
   servoB.write((int)lroundf(curB));
+  float targetSL = STEER_CENTER_DEG, targetSR = STEER_CENTER_DEG;
+  if (ctl_arm && linkOk) { targetSL = ctl_steerL; targetSR = ctl_steerR; }
+  targetSL = constrain(targetSL, STEER_CENTER_DEG - STEER_TRAVEL_DEG, STEER_CENTER_DEG + STEER_TRAVEL_DEG);
+  targetSR = constrain(targetSR, STEER_CENTER_DEG - STEER_TRAVEL_DEG, STEER_CENTER_DEG + STEER_TRAVEL_DEG);
+  curSL = slew(curSL, targetSL);
+  curSR = slew(curSR, targetSR);
+  int outSL = (int)lroundf(curSL), outSR = (int)lroundf(curSR);
+  servoSL.write(STEER_L_INVERT ? 180 - outSL : outSL);
+  servoSR.write(STEER_R_INVERT ? 180 - outSR : outSR);
 }
 
 // ---------- ESC handling (called every 20 ms) ----------
@@ -399,6 +454,10 @@ void setup() {
   servoB.setPeriodHertz(50);
   servoF.attach(SERVO_F_PIN, SERVO_MIN_US, SERVO_MAX_US);
   servoB.attach(SERVO_B_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  servoSL.setPeriodHertz(50);
+  servoSR.setPeriodHertz(50);
+  servoSL.attach(STEER_L_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  servoSR.attach(STEER_R_PIN, SERVO_MIN_US, SERVO_MAX_US);
   servosToDefault();
 
   // Access point
