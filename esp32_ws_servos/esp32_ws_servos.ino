@@ -66,6 +66,11 @@ volatile int ctl_thrA  = 0;                   // 0..100 (%)
 volatile int ctl_thrB  = 0;                   // 0..100 (%)
 volatile int ctl_steerL = STEER_CENTER_DEG;
 volatile int ctl_steerR = STEER_CENTER_DEG;
+volatile bool visionOn = false;
+volatile int  vis_steer = STEER_CENTER_DEG;
+volatile uint32_t lastVisionMs = 0;
+uint32_t controllerId = 0;                 // id of the web-page client (the one sending S packets)
+const uint32_t VISION_TIMEOUT_MS = 300;
 volatile int ctl_arm   = 0;                   // 0/1
 volatile uint32_t lastPacketMs = 0;
 
@@ -104,6 +109,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   button.arm { padding:14px; font-size:18px; font-weight:700; border-radius:12px; border:2px solid var(--line);
                background:var(--panel); color:var(--fg); }
   button.arm.on { border-color:var(--bad); background:#3a1d1d; color:#ffb3b3; }
+  button.vis.on { border-color:var(--ok); background:#1d3a28; color:#b3ffd0; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:8px 14px; }
   .card h2 { margin:0 0 4px; font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); font-weight:600; }
   .row { display:flex; align-items:baseline; justify-content:space-between; }
@@ -131,6 +137,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
 
   <button class="arm" id="arm">ARM: OFF</button>
+  <button class="arm vis" id="visionBtn" style="padding:10px;font-size:15px;" disabled>VISION: OFF</button>
 
   <div class="card">
     <h2>Front servo</h2>
@@ -208,6 +215,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   const link = document.getElementById('link');
   const stopBtn = document.getElementById('stop');
   const centerBtn = document.getElementById('centerAll');
+  const visionBtn = document.getElementById('visionBtn');
+  let vision = 0;
   const steerL = document.getElementById('steerL');
   const steerR = document.getElementById('steerR');
   const slv = document.getElementById('slv');
@@ -232,6 +241,16 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   centerBtn.addEventListener('click', () => { front.value = FRONT_REST; back.value = BACK_REST; showValues(); });
   bcenter.addEventListener('click', () => { back.value = BACK_REST; showValues(); });
 
+  function setVisionUI(v) {
+    vision = v ? 1 : 0;
+    visionBtn.textContent = 'VISION: ' + (vision ? 'ON (steering locked)' : 'OFF');
+    visionBtn.classList.toggle('on', !!vision);
+    steerL.disabled = steerR.disabled = !arm || !!vision;
+  }
+  visionBtn.addEventListener('click', () => {
+    if (ws && ws.readyState === 1) ws.send('V,' + (vision ? 0 : 1));
+  });
+
   function resetSliders() {
     front.value = FRONT_REST; back.value = BACK_REST;
     thrA.value = 0; thrB.value = 0; showValues();
@@ -242,6 +261,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     arm = v ? 1 : 0;
     resetSliders();                       // nothing jumps when arming/disarming
     front.disabled = back.disabled = bcenter.disabled = thrA.disabled = thrB.disabled = centerBtn.disabled = steerL.disabled = steerR.disabled = !arm;
+    visionBtn.disabled = !arm;
+    setVisionUI(arm ? vision : 0);
     armBtn.textContent = 'ARM: ' + (arm ? 'ON' : 'OFF');
     armBtn.classList.toggle('on', !!arm);
   }
@@ -259,9 +280,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     };
     ws.onerror = () => { try { ws.close(); } catch (e) {} };
     ws.onmessage = (ev) => {
-      if (typeof ev.data === 'string' && ev.data[0] === 'P') {
+      if (typeof ev.data !== 'string') return;
+      if (ev.data[0] === 'P') {
         const t = parseFloat(ev.data.split(',')[1]);
         rttEl.textContent = Math.round(performance.now() - t) + ' ms';
+      } else if (ev.data[0] === 'V') {
+        setVisionUI(ev.data.split(',')[1] === '1');
       }
     };
   }
@@ -297,6 +321,15 @@ void resetControls() {
   ctl_arm   = 0;
   ctl_steerL = STEER_CENTER_DEG;
   ctl_steerR = STEER_CENTER_DEG;
+  visionOn = false;
+  vis_steer = STEER_CENTER_DEG;
+}
+
+void setVision(bool on) {
+  visionOn = on;
+  vis_steer = STEER_CENTER_DEG;
+  lastVisionMs = 0;                        // stale until the first H packet arrives
+  ws.textAll(on ? "V,1" : "V,0");
 }
 
 void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client, AwsEventType type,
@@ -304,11 +337,15 @@ void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client, AwsEventType t
   switch (type) {
     case WS_EVT_CONNECT:
       Serial.printf("WS client #%u connected\n", client->id());
+      client->text(visionOn ? "V,1" : "V,0");      // tell the new client the current state
       break;
 
     case WS_EVT_DISCONNECT:
       Serial.printf("WS client #%u disconnected\n", client->id());
-      resetControls();
+      if (client->id() == controllerId) {           // only the web page disarms; Python dropping doesn't 
+        resetControls();
+        ws.textAll("V,0");
+      }
       break;
 
     case WS_EVT_DATA: {
@@ -331,6 +368,17 @@ void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client, AwsEventType t
           ctl_thrB  = constrain(tb, -100, 100);
           ctl_arm   = a ? 1 : 0;
           lastPacketMs = millis();
+          controllerId = client->id();
+          if (!ctl_arm && visionOn) setVision(false);   // disarm always turns vision off
+        }
+      } else if (buf[0] == 'V') {
+        int v = 0;
+        if (sscanf(buf, "V,%d", &v) == 1) setVision(v && ctl_arm);   // only possible while armed
+      } else if (buf[0] == 'H') {
+        int h;
+        if (sscanf(buf, "H,%d", &h) == 1) {
+          vis_steer = constrain(h, STEER_CENTER_DEG - STEER_TRAVEL_DEG, STEER_CENTER_DEG + STEER_TRAVEL_DEG);
+          lastVisionMs = millis();
         }
       } else if (buf[0] == 'P') {
         client->text(buf);              // echo back for latency measurement
@@ -377,7 +425,15 @@ void updateServos() {
   servoF.write((int)lroundf(curF));
   servoB.write((int)lroundf(curB));
   float targetSL = STEER_CENTER_DEG, targetSR = STEER_CENTER_DEG;
-  if (ctl_arm && linkOk) { targetSL = ctl_steerL; targetSR = ctl_steerR; }
+    if (ctl_arm && linkOk) {
+    if (visionOn) {
+      bool visFresh = (millis() - lastVisionMs) < VISION_TIMEOUT_MS;
+      targetSL = targetSR = visFresh ? vis_steer : STEER_CENTER_DEG;
+    } else {
+      targetSL = ctl_steerL;
+      targetSR = ctl_steerR;
+    }
+  }
   targetSL = constrain(targetSL, STEER_CENTER_DEG - STEER_TRAVEL_DEG, STEER_CENTER_DEG + STEER_TRAVEL_DEG);
   targetSR = constrain(targetSR, STEER_CENTER_DEG - STEER_TRAVEL_DEG, STEER_CENTER_DEG + STEER_TRAVEL_DEG);
   curSL = slew(curSL, targetSL);
