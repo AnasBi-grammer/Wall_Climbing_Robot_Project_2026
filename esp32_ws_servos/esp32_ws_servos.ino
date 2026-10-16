@@ -36,7 +36,8 @@ const int SERVO_MAX_US = 2400;       // pulse width for 180 deg (calibrate if th
 // ---------- ESC settings (standard 50 Hz PWM, 1000..2000 us) ----------
 const int ESC_A_PIN = 25;            // ESC 1 signal pin (change to your wiring)
 const int ESC_B_PIN = 26;            // ESC 2 signal pin (change to your wiring)
-const int ESC_MIN_US = 1000;         // zero throttle (also the arming signal)
+const int ESC_MIN_US = 1000;         // full reverse
+const int ESC_NEUTRAL_US = 1500;     // zero throttle
 const int ESC_MAX_US = 2000;         // full throttle
 
 const float THROTTLE_LIMIT_PCT = 30.0;     // slider 100% = 30% of full ESC range. RAISE ONLY AFTER TESTING.
@@ -44,7 +45,7 @@ const uint32_t ESC_ARM_HOLD_MS = 3000;     // hold zero throttle this long after
 const float RAMP_UP_PER_STEP   = 1.5;      // slider % per 20 ms going up  (~75 % per second)
 const float RAMP_DOWN_PER_STEP = 5.0;      // slider % per 20 ms going down
 
-const int FRONT_DEFAULT_DEG = 0;     // front rests at 0, slider range 0..180
+const int FRONT_DEFAULT_DEG = 90;     // front rests at 90, slider range 0..180 (90 each side)
 const int BACK_DEFAULT_DEG  = 90;    // back rests at 90, slider range 0..180 (90 each side)
 
 const float SLEW_DEG_PER_STEP = 5.0; // speed limit: 5 deg per 20 ms (~250 deg/s)
@@ -121,9 +122,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
   <div class="card">
     <h2>Front servo</h2>
-    <div class="row"><div class="val"><span id="fv">0</span><small>&deg;</small></div></div>
-    <input type="range" id="front" min="0" max="180" value="0" disabled>
-    <div class="ends"><span>0&deg; (rest)</span><span>180&deg;</span></div>
+    <div class="row">
+      <div class="val"><span id="fv">90</span><small>&deg;</small></div>
+      <input type="range" id="front" min="0" max="180" value="90" disabled>
+      <div class="ends"><span>0&deg;</span><span>90&deg; (rest)</span><span>180&deg;</span></div>
   </div>
 
   <div class="card">
@@ -139,8 +141,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="card">
     <h2>Motor 1 (ESC 1)</h2>
     <div class="row"><div class="val"><span id="av">0</span><small>%</small></div></div>
-    <input type="range" id="thrA" min="0" max="100" value="0" disabled>
-    <div class="ends"><span>0% (stop)</span><span>100%</span></div>
+    <input type="range" id="thrA" min="-100" max="100" value="0" disabled>
+    <div class="ends"><span>-100% (rev)</span><span>0</span><span>100% (fwd)</span></div>
   </div>
 
   <div class="card">
@@ -151,8 +153,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <input type="checkbox" id="link" style="width:18px;height:18px;"> Link both
       </label>
     </div>
-    <input type="range" id="thrB" min="0" max="100" value="0" disabled>
-    <div class="ends"><span>0% (stop)</span><span>100%</span></div>
+    <input type="range" id="thrB" min="-100" max="100" value="0" disabled>
+    <div class="ends"><span>-100% (rev)</span><span>0</span><span>100% (fwd)</span></div>
   </div>
 
   <button class="arm" id="stop" style="padding:10px;font-size:15px;">MOTORS TO 0</button>
@@ -178,7 +180,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   const link = document.getElementById('link');
   const stopBtn = document.getElementById('stop');
 
-  const FRONT_REST = 0, BACK_REST = 90;
+  const FRONT_REST = 90, BACK_REST = 90;
   let arm = 0;
   let ws = null;
 
@@ -282,8 +284,8 @@ void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client, AwsEventType t
         if (sscanf(buf, "S,%d,%d,%d,%d,%d", &f, &b, &ta, &tb, &a) == 5) {
           ctl_front = constrain(f, 0, 180);
           ctl_back  = constrain(b, 0, 180);
-          ctl_thrA  = constrain(ta, 0, 100);
-          ctl_thrB  = constrain(tb, 0, 100);
+          ctl_thrA  = constrain(ta, -100, 100);
+          ctl_thrB  = constrain(tb, -100, 100);
           ctl_arm   = a ? 1 : 0;
           lastPacketMs = millis();
         }
@@ -332,20 +334,21 @@ void updateServos() {
 
 // ---------- ESC handling (called every 20 ms) ----------
 int throttleToUs(float pct) {
-  float frac = (pct / 100.0f) * (THROTTLE_LIMIT_PCT / 100.0f);
-  return ESC_MIN_US + (int)lroundf((ESC_MAX_US - ESC_MIN_US) * frac);
+  float frac = (pct / 100.0f) * (THROTTLE_LIMIT_PCT / 100.0f);   // -1..+1 after the limit
+  return ESC_NEUTRAL_US + (int)lroundf((ESC_MAX_US - ESC_NEUTRAL_US) * frac);
 }
 
 void escsToZero() {
   curThrA = curThrB = 0;
-  escA.writeMicroseconds(ESC_MIN_US);
-  escB.writeMicroseconds(ESC_MIN_US);
+  escA.writeMicroseconds(ESC_NEUTRAL_US);
+  escB.writeMicroseconds(ESC_NEUTRAL_US);
 }
 
 float ramp(float cur, float target) {
   float d = target - cur;
-  if (d >  RAMP_UP_PER_STEP)   d =  RAMP_UP_PER_STEP;
-  if (d < -RAMP_DOWN_PER_STEP) d = -RAMP_DOWN_PER_STEP;
+  float limit = (fabsf(target) < fabsf(cur)) ? RAMP_DOWN_PER_STEP : RAMP_UP_PER_STEP;
+  if (d >  limit) d =  limit;
+  if (d < -limit) d = -limit;
   return cur + d;
 }
 
